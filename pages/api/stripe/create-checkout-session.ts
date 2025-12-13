@@ -2,7 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next"
 import Stripe from "stripe"
 import { createClient } from "@supabase/supabase-js"
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: "2024-06-20" })
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: "2023-10-16" })
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -65,3 +65,4 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(500).json({ error: err?.message ?? "Server error" })
   }
 }
+
