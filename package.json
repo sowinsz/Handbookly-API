@@ -13,5 +13,12 @@
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "stripe": "^14.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/node": "^20.14.10",
+    "@types/react": "^18.3.3"
   }
 }
+
+
