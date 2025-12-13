@@ -7,112 +7,100 @@ export const config = {
   api: { bodyParser: false },
 }
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
   apiVersion: "2023-10-16",
 })
 
 const supabaseAdmin = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
+  process.env.SUPABASE_URL || "",
+  process.env.SUPABASE_SERVICE_ROLE_KEY || ""
 )
 
-function planFromPriceId(priceId: string): "pro" | "business" | "free" {
+function planFromPrice(priceId: string | null | undefined): "pro" | "business" | null {
+  if (!priceId) return null
   if (priceId === process.env.NEXT_PUBLIC_STRIPE_GROWTH_PRICE_ID) return "pro"
   if (priceId === process.env.NEXT_PUBLIC_STRIPE_BUSINESS_PRICE_ID) return "business"
-  return "free"
+  return null
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  const sig = req.headers["stripe-signature"]
-  if (!sig) return res.status(400).send("Missing stripe-signature")
+  console.log("HIT webhook", req.method)
 
-  let event: Stripe.Event
-
-  try {
-    const buf = await buffer(req)
-    event = stripe.webhooks.constructEvent(
-      buf,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET!
-    )
-  } catch (err: any) {
-    console.error("Webhook signature verification failed.", err.message)
-    return res.status(400).send(`Webhook Error: ${err.message}`)
+  if (req.method !== "POST") {
+    return res.status(405).send("Method Not Allowed")
   }
 
+  if (!process.env.STRIPE_SECRET_KEY) return res.status(500).send("Missing STRIPE_SECRET_KEY")
+  if (!process.env.STRIPE_WEBHOOK_SECRET) return res.status(500).send("Missing STRIPE_WEBHOOK_SECRET")
+  if (!process.env.SUPABASE_URL) return res.status(500).send("Missing SUPABASE_URL")
+  if (!process.env.SUPABASE_SERVICE_ROLE_KEY) return res.status(500).send("Missing SUPABASE_SERVICE_ROLE_KEY")
+
   try {
-    // Handle successful checkout and subscription changes
+    const sig = req.headers["stripe-signature"]
+    if (!sig || Array.isArray(sig)) return res.status(400).send("Missing stripe-signature")
+
+    const rawBody = await buffer(req)
+    const event = stripe.webhooks.constructEvent(
+      rawBody,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    )
+
+    console.log("Stripe event:", event.type)
+
+    // We update plan when a subscription is created/updated/paid
     if (
       event.type === "checkout.session.completed" ||
       event.type === "customer.subscription.created" ||
-      event.type === "customer.subscription.updated"
+      event.type === "customer.subscription.updated" ||
+      event.type === "invoice.paid"
     ) {
-      const obj: any = event.data.object
+      let userId: string | null = null
+      let priceId: string | null = null
 
-      // Resolve Stripe customer id
-      const customerId = obj.customer as string | undefined
-      if (!customerId) return res.json({ received: true })
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object as Stripe.Checkout.Session
+        userId = (session.metadata?.user_id as string) || null
 
-      // Find Supabase user_id from our mapping table
-      const { data: mapping, error: mapErr } = await supabaseAdmin
-        .from("stripe_customers")
-        .select("user_id")
-        .eq("stripe_customer_id", customerId)
-        .maybeSingle()
+        // session line items aren't expanded by default, so we rely on metadata target_plan
+        const targetPlan = (session.metadata?.target_plan as string) || null
+        if (targetPlan === "pro" || targetPlan === "business") {
+          const { error } = await supabaseAdmin
+            .from("profiles")
+            .update({ plan: targetPlan })
+            .eq("id", userId)
 
-      if (mapErr) throw new Error(mapErr.message)
-      if (!mapping?.user_id) return res.json({ received: true })
+          if (error) {
+            console.error("profiles update error:", error)
+            return res.status(500).send("Failed to update profile plan")
+          }
+          console.log("Updated plan via checkout.session.completed:", userId, targetPlan)
+        }
+      } else {
+        const sub = event.data.object as Stripe.Subscription
+        // try metadata on subscription
+        userId = (sub.metadata?.user_id as string) || null
+        priceId = sub.items?.data?.[0]?.price?.id || null
+        const nextPlan = planFromPrice(priceId)
 
-      // Resolve priceId: best source is the subscription itself
-      let priceId: string | undefined
+        if (userId && nextPlan) {
+          const { error } = await supabaseAdmin
+            .from("profiles")
+            .update({ plan: nextPlan })
+            .eq("id", userId)
 
-      if (event.type === "checkout.session.completed" && obj.subscription) {
-        const sub = await stripe.subscriptions.retrieve(obj.subscription as string)
-        priceId = sub.items.data[0]?.price?.id
-      } else if (obj.items?.data?.[0]?.price?.id) {
-        priceId = obj.items.data[0].price.id
-      }
-
-      if (priceId) {
-        const nextPlan = planFromPriceId(priceId)
-
-        const { error: updErr } = await supabaseAdmin
-          .from("profiles")
-          .update({ plan: nextPlan })
-          .eq("id", mapping.user_id)
-
-        if (updErr) throw new Error(updErr.message)
-      }
-    }
-
-    // Downgrade on subscription cancel
-    if (event.type === "customer.subscription.deleted") {
-      const sub: any = event.data.object
-      const customerId = sub.customer as string | undefined
-      if (!customerId) return res.json({ received: true })
-
-      const { data: mapping, error: mapErr } = await supabaseAdmin
-        .from("stripe_customers")
-        .select("user_id")
-        .eq("stripe_customer_id", customerId)
-        .maybeSingle()
-
-      if (mapErr) throw new Error(mapErr.message)
-
-      if (mapping?.user_id) {
-        const { error: updErr } = await supabaseAdmin
-          .from("profiles")
-          .update({ plan: "free" })
-          .eq("id", mapping.user_id)
-
-        if (updErr) throw new Error(updErr.message)
+          if (error) {
+            console.error("profiles update error:", error)
+            return res.status(500).send("Failed to update profile plan")
+          }
+          console.log("Updated plan via subscription/invoice:", userId, nextPlan)
+        }
       }
     }
 
-    return res.json({ received: true })
+    return res.status(200).json({ received: true })
   } catch (err: any) {
-    console.error("Webhook handler failed:", err.message)
-    return res.status(500).send(err.message)
+    console.error("webhook error:", err?.message || err)
+    return res.status(400).send(`Webhook Error: ${err?.message || "unknown"}`)
   }
 }
-
