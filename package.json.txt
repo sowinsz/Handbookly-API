@@ -1,0 +1,9 @@
+{
+  "name": "handbookly-api",
+  "private": true,
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "micro": "^9.4.1",
+    "stripe": "^14.0.0"
+  }
+}

@@ -1,0 +1,77 @@
+import type { NextApiRequest, NextApiResponse } from "next"
+import Stripe from "stripe"
+import { createClient } from "@supabase/supabase-js"
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2024-06-20",
+})
+
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+)
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" })
+  }
+
+  try {
+    const { userId, email, priceId, successUrl, cancelUrl } = req.body as {
+      userId: string
+      email: string
+      priceId: string
+      successUrl: string
+      cancelUrl: string
+    }
+
+    if (!userId || !email || !priceId || !successUrl || !cancelUrl) {
+      return res.status(400).json({ error: "Missing required fields" })
+    }
+
+    // Find or create Stripe customer mapped to this Supabase user
+    const { data: existing, error: lookupErr } = await supabaseAdmin
+      .from("stripe_customers")
+      .select("stripe_customer_id")
+      .eq("user_id", userId)
+      .maybeSingle()
+
+    if (lookupErr) {
+      return res.status(500).json({ error: lookupErr.message })
+    }
+
+    let customerId = existing?.stripe_customer_id
+
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email,
+        metadata: { userId },
+      })
+      customerId = customer.id
+
+      const { error: upsertErr } = await supabaseAdmin
+        .from("stripe_customers")
+        .upsert({ user_id: userId, stripe_customer_id: customerId })
+
+      if (upsertErr) {
+        return res.status(500).json({ error: upsertErr.message })
+      }
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer: customerId,
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      allow_promotion_codes: true,
+      // Optional: metadata helps debugging
+      metadata: { userId },
+    })
+
+    return res.status(200).json({ url: session.url })
+  } catch (err: any) {
+    console.error(err)
+    return res.status(500).json({ error: err?.message ?? "Server error" })
+  }
+}
