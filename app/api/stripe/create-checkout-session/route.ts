@@ -63,15 +63,25 @@ export async function POST(req: Request) {
       )
     }
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      line_items: [{ price, quantity: 1 }],
-      success_url: successUrl,
-      cancel_url: cancelUrl,
-      customer_email: email || undefined,
-      client_reference_id: userId || undefined,
-      metadata: { user_id: userId || "", target_plan: plan },
-    })
+   const session = await stripe.checkout.sessions.create({
+  mode: "subscription",
+  line_items: [{ price, quantity: 1 }],
+  success_url: successUrl,
+  cancel_url: cancelUrl,
+
+  // Email-first (great for now)
+  customer_email: email || undefined,
+
+  // For later upgrade to userId
+  client_reference_id: userId || undefined,
+
+  metadata: {
+    plan: String(plan),                // "pro" | "business" | whatever you use
+    email: email ? String(email) : "", // optional, but helpful for debugging
+    ...(userId ? { userId: String(userId) } : {}),
+  },
+});
+
 
     return Response.json(
       { url: session.url },
