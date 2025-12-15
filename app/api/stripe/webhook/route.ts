@@ -2,15 +2,15 @@ import Stripe from "stripe";
 import { headers } from "next/headers";
 import { createClient } from "@supabase/supabase-js";
 
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
-
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
 
 export async function POST(req: Request) {
   const sig = headers().get("stripe-signature");
@@ -45,87 +45,70 @@ export async function POST(req: Request) {
 
   console.log("✅ Stripe event verified:", event.type);
 
-switch (event.type) {
-  case "checkout.session.completed": {
-  const session = event.data.object as Stripe.Checkout.Session;
+  switch (event.type) {
+    case "checkout.session.completed": {
+      const session = event.data.object as Stripe.Checkout.Session;
 
-  const email =
-    session.customer_details?.email ??
-    session.customer_email;
+      const email =
+        session.customer_details?.email ??
+        session.customer_email;
 
-  if (!email) {
-    console.error("❌ No email on checkout session", { sessionId: session.id });
-    break;
-  }
+      if (!email) {
+        console.error("❌ No email on checkout session", { sessionId: session.id });
+        break;
+      }
 
-  const subscriptionId =
-    typeof session.subscription === "string"
-      ? session.subscription
-      : null;
+      const subscriptionId =
+        typeof session.subscription === "string" ? session.subscription : null;
 
-  const customerId =
-    typeof session.customer === "string"
-      ? session.customer
-      : null;
+      const customerId =
+        typeof session.customer === "string" ? session.customer : null;
 
-  const { error } = await supabase
-    .from("subscriptions")
-    .upsert(
-      {
-        email,
-        stripe_customer_id: customerId,
-        stripe_subscription_id: subscriptionId,
-        plan: session.metadata?.plan ?? "unknown",
-        status: "active",
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "email" }
-    );
+      const { error } = await supabase
+        .from("subscriptions")
+        .upsert(
+          {
+            email,
+            stripe_customer_id: customerId,
+            stripe_subscription_id: subscriptionId,
+            plan: session.metadata?.plan ?? "unknown",
+            status: "active",
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "email" }
+        );
 
-  if (error) {
-    console.error("❌ Supabase upsert failed:", error);
-  } else {
-    console.log("✅ Wrote subscription row for:", email);
-  }
+      if (error) {
+        console.error("❌ Supabase upsert failed:", error);
+      } else {
+        console.log("✅ Wrote subscription row for:", email);
+      }
 
-  break;
-}
+      break;
+    }
 
+    case "customer.subscription.deleted": {
+      const subscription = event.data.object as Stripe.Subscription;
 
-  case "invoice.paid": {
-    const invoice = event.data.object as Stripe.Invoice;
-
-    if (invoice.customer_email) {
       await supabase
         .from("subscriptions")
         .update({
-          status: "active",
+          status: "canceled",
           updated_at: new Date().toISOString(),
         })
-        .eq("email", invoice.customer_email);
+        .eq("stripe_subscription_id", subscription.id);
+
+      break;
     }
 
-    break;
-  }
+    case "invoice.paid": {
+      // Optional: useful later. Leaving as no-op for now.
+      break;
+    }
 
-  case "customer.subscription.deleted": {
-    const subscription = event.data.object as Stripe.Subscription;
-
-    await supabase
-      .from("subscriptions")
-      .update({
-        status: "canceled",
-        updated_at: new Date().toISOString(),
-      })
-      .eq("stripe_subscription_id", subscription.id);
-
-    break;
-  }
-
-  default:
-    console.log("Ignoring event:", event.type);
-}
-
+    default: {
+      console.log("Ignoring event:", event.type);
+    }
   }
 
   return new Response("ok", { status: 200 });
