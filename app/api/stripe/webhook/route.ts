@@ -47,49 +47,50 @@ export async function POST(req: Request) {
 
 switch (event.type) {
   case "checkout.session.completed": {
-    const session = event.data.object as Stripe.Checkout.Session;
+  const session = event.data.object as Stripe.Checkout.Session;
 
-    const email =
-      session.customer_details?.email ??
-      session.customer_email;
+  const email =
+    session.customer_details?.email ??
+    session.customer_email;
 
-    if (!email) {
-      console.error("❌ No email on checkout session");
-      break;
-    }
-
-    const subscriptionId =
-      typeof session.subscription === "string"
-        ? session.subscription
-        : null;
-
-    const customerId =
-      typeof session.customer === "string"
-        ? session.customer
-        : null;
-
-    const plan = session.metadata?.plan ?? "unknown";
-
-    const { error } = await supabase
-      .from("subscriptions")
-      .upsert(
-        {
-          email,
-          stripe_customer_id: customerId,
-          stripe_subscription_id: subscriptionId,
-          plan,
-          status: "active",
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "email" }
-      );
-
-    if (error) {
-      console.error("❌ Supabase upsert failed:", error);
-    }
-
+  if (!email) {
+    console.error("❌ No email on checkout session", { sessionId: session.id });
     break;
   }
+
+  const subscriptionId =
+    typeof session.subscription === "string"
+      ? session.subscription
+      : null;
+
+  const customerId =
+    typeof session.customer === "string"
+      ? session.customer
+      : null;
+
+  const { error } = await supabase
+    .from("subscriptions")
+    .upsert(
+      {
+        email,
+        stripe_customer_id: customerId,
+        stripe_subscription_id: subscriptionId,
+        plan: session.metadata?.plan ?? "unknown",
+        status: "active",
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "email" }
+    );
+
+  if (error) {
+    console.error("❌ Supabase upsert failed:", error);
+  } else {
+    console.log("✅ Wrote subscription row for:", email);
+  }
+
+  break;
+}
+
 
   case "invoice.paid": {
     const invoice = event.data.object as Stripe.Invoice;
