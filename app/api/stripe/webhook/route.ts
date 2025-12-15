@@ -1,5 +1,11 @@
 import Stripe from "stripe";
 import { headers } from "next/headers";
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -39,25 +45,86 @@ export async function POST(req: Request) {
 
   console.log("✅ Stripe event verified:", event.type);
 
-  switch (event.type) {
-    case "checkout.session.completed": {
-      // create subscription in DB
+switch (event.type) {
+  case "checkout.session.completed": {
+    const session = event.data.object as Stripe.Checkout.Session;
+
+    const email =
+      session.customer_details?.email ??
+      session.customer_email;
+
+    if (!email) {
+      console.error("❌ No email on checkout session");
       break;
     }
 
-    case "invoice.paid": {
-      // keep user active
-      break;
+    const subscriptionId =
+      typeof session.subscription === "string"
+        ? session.subscription
+        : null;
+
+    const customerId =
+      typeof session.customer === "string"
+        ? session.customer
+        : null;
+
+    const plan = session.metadata?.plan ?? "unknown";
+
+    const { error } = await supabase
+      .from("subscriptions")
+      .upsert(
+        {
+          email,
+          stripe_customer_id: customerId,
+          stripe_subscription_id: subscriptionId,
+          plan,
+          status: "active",
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "email" }
+      );
+
+    if (error) {
+      console.error("❌ Supabase upsert failed:", error);
     }
 
-    case "customer.subscription.deleted": {
-      // revoke access
-      break;
+    break;
+  }
+
+  case "invoice.paid": {
+    const invoice = event.data.object as Stripe.Invoice;
+
+    if (invoice.customer_email) {
+      await supabase
+        .from("subscriptions")
+        .update({
+          status: "active",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("email", invoice.customer_email);
     }
 
-    default: {
-      console.log("Ignoring event:", event.type);
-    }
+    break;
+  }
+
+  case "customer.subscription.deleted": {
+    const subscription = event.data.object as Stripe.Subscription;
+
+    await supabase
+      .from("subscriptions")
+      .update({
+        status: "canceled",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("stripe_subscription_id", subscription.id);
+
+    break;
+  }
+
+  default:
+    console.log("Ignoring event:", event.type);
+}
+
   }
 
   return new Response("ok", { status: 200 });
