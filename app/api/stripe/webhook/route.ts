@@ -13,8 +13,8 @@ export async function POST(req: Request) {
   if (!sig) return new Response("Missing stripe-signature", { status: 400 });
 
   const secrets = [
-    process.env.STRIPE_WEBHOOK_SECRET,        // Dashboard endpoint secret
-    process.env.STRIPE_CLI_WEBHOOK_SECRET,    // CLI listen secret
+    process.env.STRIPE_WEBHOOK_SECRET, // Dashboard endpoint secret
+    process.env.STRIPE_CLI_WEBHOOK_SECRET, // CLI listen secret
   ].filter(Boolean) as string[];
 
   let event: Stripe.Event | null = null;
@@ -31,14 +31,39 @@ export async function POST(req: Request) {
 
   if (!event) {
     console.error("❌ Webhook signature verification failed:", lastErr?.message);
-    return new Response(`Webhook Error: ${lastErr?.message ?? "Invalid signature"}`, { status: 400 });
+    return new Response(
+      `Webhook Error: ${lastErr?.message ?? "Invalid signature"}`,
+      { status: 400 }
+    );
   }
 
   console.log("✅ Stripe event verified:", event.type);
+
+  switch (event.type) {
+    case "checkout.session.completed": {
+      // create subscription in DB
+      break;
+    }
+
+    case "invoice.paid": {
+      // keep user active
+      break;
+    }
+
+    case "customer.subscription.deleted": {
+      // revoke access
+      break;
+    }
+
+    default: {
+      console.log("Ignoring event:", event.type);
+    }
+  }
+
   return new Response("ok", { status: 200 });
 }
-
 
 export async function GET() {
   return new Response("Method Not Allowed", { status: 405 });
 }
+
