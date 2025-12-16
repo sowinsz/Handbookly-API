@@ -21,13 +21,11 @@ async function supabaseUpsertSubscription(row: {
   current_period_end?: string | null;
   updated_at?: string | null;
 }) {
-
   const SUPABASE_URL = mustEnv("SUPABASE_URL");
   const SERVICE_ROLE = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
 
-  // Upsert by email (requires a UNIQUE constraint on email, which you likely have / want)
-  const url =
-    `${SUPABASE_URL}/rest/v1/subscriptions?on_conflict=email`;
+  // Upsert by email (requires a UNIQUE constraint on email)
+  const url = `${SUPABASE_URL}/rest/v1/subscriptions?on_conflict=email`;
 
   const res = await fetch(url, {
     method: "POST",
@@ -52,8 +50,9 @@ async function supabaseCancelBySubscriptionId(subscriptionId: string) {
   const SUPABASE_URL = mustEnv("SUPABASE_URL");
   const SERVICE_ROLE = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
 
-  const url =
-    `${SUPABASE_URL}/rest/v1/subscriptions?stripe_subscription_id=eq.${encodeURIComponent(subscriptionId)}`;
+  const url = `${SUPABASE_URL}/rest/v1/subscriptions?stripe_subscription_id=eq.${encodeURIComponent(
+    subscriptionId
+  )}`;
 
   const res = await fetch(url, {
     method: "PATCH",
@@ -73,6 +72,47 @@ async function supabaseCancelBySubscriptionId(subscriptionId: string) {
     const text = await res.text();
     throw new Error(`Supabase cancel update failed: ${res.status} ${text}`);
   }
+
+  return res.json().catch(() => null);
+}
+
+/**
+ * ✅ NEW: Update the user's plan in profiles so the Dashboard reflects upgrades.
+ * This assumes your `profiles` table has columns:
+ * - id (uuid) [matches Supabase auth user id]
+ * - plan (text)
+ * - updated_at (optional; safe if exists)
+ */
+async function supabaseUpdateProfilePlanByUserId(userId: string, plan: string) {
+  const SUPABASE_URL = mustEnv("SUPABASE_URL");
+  const SERVICE_ROLE = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+
+  const url = `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(
+    userId
+  )}`;
+
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      apikey: SERVICE_ROLE,
+      Authorization: `Bearer ${SERVICE_ROLE}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+    },
+    body: JSON.stringify({
+      plan, // "starter" | "growth" | "business"
+      updated_at: new Date().toISOString(),
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(
+      `Supabase profile plan update failed: ${res.status} ${text}`
+    );
+  }
+
+  return res.json().catch(() => null);
 }
 
 export async function POST(req: Request) {
@@ -82,8 +122,8 @@ export async function POST(req: Request) {
   if (!sig) return new Response("Missing stripe-signature", { status: 400 });
 
   const secrets = [
-    process.env.STRIPE_WEBHOOK_SECRET,      // Stripe dashboard endpoint secret (whsec_...)
-    process.env.STRIPE_CLI_WEBHOOK_SECRET,  // Stripe CLI listen secret (whsec_...)
+    process.env.STRIPE_WEBHOOK_SECRET, // Stripe dashboard endpoint secret (whsec_...)
+    process.env.STRIPE_CLI_WEBHOOK_SECRET, // Stripe CLI listen secret (whsec_...)
   ].filter(Boolean) as string[];
 
   let event: Stripe.Event | null = null;
@@ -100,9 +140,10 @@ export async function POST(req: Request) {
 
   if (!event) {
     console.error("❌ Webhook signature verification failed:", lastErr?.message);
-    return new Response(`Webhook Error: ${lastErr?.message ?? "Invalid signature"}`, {
-      status: 400,
-    });
+    return new Response(
+      `Webhook Error: ${lastErr?.message ?? "Invalid signature"}`,
+      { status: 400 }
+    );
   }
 
   console.log("✅ Stripe event verified:", event.type);
@@ -113,14 +154,7 @@ export async function POST(req: Request) {
         const session = event.data.object as Stripe.Checkout.Session;
 
         const email =
-          session.customer_details?.email ??
-          session.customer_email ??
-          null;
-
-        if (!email) {
-          console.error("❌ No email on checkout session", { sessionId: session.id });
-          break;
-        }
+          session.customer_details?.email ?? session.customer_email ?? null;
 
         const subscriptionId =
           typeof session.subscription === "string" ? session.subscription : null;
@@ -128,18 +162,49 @@ export async function POST(req: Request) {
         const customerId =
           typeof session.customer === "string" ? session.customer : null;
 
-        const plan = session.metadata?.plan ?? "unknown";
+        const plan = (session.metadata?.plan ?? "unknown").toLowerCase();
 
-        await supabaseUpsertSubscription({
-          email,
-          stripe_customer_id: customerId,
-          stripe_subscription_id: subscriptionId,
-          plan,
-          status: "active",
-          updated_at: new Date().toISOString(),
-        });
+        // ✅ Get the Supabase auth user id (passed from your checkout creation route)
+        const userId =
+          session.client_reference_id ?? session.metadata?.userId ?? null;
 
-        console.log("✅ Wrote/updated subscription row for:", email);
+        if (!email) {
+          console.error("❌ No email on checkout session", {
+            sessionId: session.id,
+          });
+          // We can still try to update profile if we have userId, but subscriptions upsert needs email.
+        }
+
+        if (!userId) {
+          console.error(
+            "❌ No userId on checkout session (client_reference_id/metadata.userId missing)",
+            { sessionId: session.id }
+          );
+          break;
+        }
+
+        // 1) Update subscriptions table (your existing behavior)
+        if (email) {
+          await supabaseUpsertSubscription({
+            email,
+            stripe_customer_id: customerId,
+            stripe_subscription_id: subscriptionId,
+            plan,
+            status: "active",
+            updated_at: new Date().toISOString(),
+          });
+
+          console.log("✅ Wrote/updated subscription row for:", email);
+        } else {
+          console.log(
+            "⚠️ Skipped subscriptions upsert because email was missing (but will still update profiles.plan)."
+          );
+        }
+
+        // 2) ✅ Update profiles.plan so the Dashboard shows the new plan
+        await supabaseUpdateProfilePlanByUserId(userId, plan);
+        console.log("✅ Updated profiles.plan for userId:", userId, "->", plan);
+
         break;
       }
 
@@ -164,4 +229,5 @@ export async function POST(req: Request) {
 export async function GET() {
   return new Response("Method Not Allowed", { status: 405 });
 }
+
 
