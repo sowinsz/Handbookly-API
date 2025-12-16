@@ -1,9 +1,7 @@
 import Stripe from "stripe";
 
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
 
-// Server-side Stripe client (uses your STRIPE_SECRET_KEY from Vercel env vars)
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
   apiVersion: "2023-10-16",
 });
@@ -21,11 +19,12 @@ export async function OPTIONS(req: Request) {
   return new Response(null, { status: 204, headers: corsHeaders(origin) });
 }
 
+type Plan = "starter" | "growth" | "business";
+
 export async function POST(req: Request) {
   const origin = req.headers.get("origin");
 
   try {
-    // --- Required env checks ---
     if (!process.env.STRIPE_SECRET_KEY) {
       return Response.json(
         { error: "Missing STRIPE_SECRET_KEY" },
@@ -33,33 +32,26 @@ export async function POST(req: Request) {
       );
     }
 
-    const proPrice = process.env.NEXT_PUBLIC_STRIPE_GROWTH_PRICE_ID;
-    const businessPrice = process.env.NEXT_PUBLIC_STRIPE_BUSINESS_PRICE_ID;
-
-    if (!proPrice || !businessPrice) {
-      return Response.json(
-        {
-          error: "Missing Stripe price env vars",
-          detail:
-            "Set NEXT_PUBLIC_STRIPE_GROWTH_PRICE_ID and NEXT_PUBLIC_STRIPE_BUSINESS_PRICE_ID in Vercel (Production).",
-        },
-        { status: 500, headers: corsHeaders(origin) }
-      );
-    }
-
-    // --- Parse body ---
     const body = await req.json().catch(() => null);
 
-    const planRaw = String(body?.plan ?? "").toLowerCase().trim();
-    if (planRaw !== "pro" && planRaw !== "business") {
+    const planRaw = (body?.plan ?? "").toString().toLowerCase();
+    const plan = planRaw as Plan;
+
+    const successUrl = body?.successUrl ? String(body.successUrl) : undefined;
+    const cancelUrl = body?.cancelUrl ? String(body.cancelUrl) : undefined;
+
+    const userId = body?.userId ? String(body.userId) : undefined;
+    const email = body?.email ? String(body.email) : undefined;
+
+    // ✅ IMPORTANT: these must match what Framer sends!
+    const allowedPlans: Plan[] = ["starter", "growth", "business"];
+    if (!allowedPlans.includes(plan)) {
       return Response.json(
-        { error: "plan must be 'pro' or 'business'" },
+        { error: `plan must be one of: ${allowedPlans.join(", ")}` },
         { status: 400, headers: corsHeaders(origin) }
       );
     }
 
-    const successUrl = body?.successUrl ? String(body.successUrl) : "";
-    const cancelUrl = body?.cancelUrl ? String(body.cancelUrl) : "";
     if (!successUrl || !cancelUrl) {
       return Response.json(
         { error: "Missing successUrl or cancelUrl" },
@@ -67,38 +59,40 @@ export async function POST(req: Request) {
       );
     }
 
-    const email = body?.email ? String(body.email) : undefined; // email-first
-    const userId = body?.userId ? String(body.userId) : undefined; // later upgrade path
+    // Map plan -> price id (set these in Vercel env vars)
+    const starterPrice = process.env.NEXT_PUBLIC_STRIPE_STARTER_PRICE_ID;
+    const growthPrice = process.env.NEXT_PUBLIC_STRIPE_GROWTH_PRICE_ID;
+    const businessPrice = process.env.NEXT_PUBLIC_STRIPE_BUSINESS_PRICE_ID;
 
-    const priceId = planRaw === "pro" ? proPrice : businessPrice;
+    const price =
+      plan === "starter" ? starterPrice : plan === "growth" ? growthPrice : businessPrice;
 
-    // --- Create Checkout Session ---
+    if (!price) {
+      return Response.json(
+        {
+          error: "Missing Stripe price ID env var for selected plan",
+          detail:
+            "Set NEXT_PUBLIC_STRIPE_STARTER_PRICE_ID / NEXT_PUBLIC_STRIPE_GROWTH_PRICE_ID / NEXT_PUBLIC_STRIPE_BUSINESS_PRICE_ID in Vercel (Production).",
+        },
+        { status: 500, headers: corsHeaders(origin) }
+      );
+    }
+
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
-      line_items: [{ price: priceId, quantity: 1 }],
+      line_items: [{ price, quantity: 1 }],
       success_url: successUrl,
       cancel_url: cancelUrl,
 
-      // Email-first
-      customer_email: email,
+      customer_email: email || undefined,
+      client_reference_id: userId || undefined,
 
-      // Later you can use this to correlate to your DB user
-      client_reference_id: userId,
-
-      // Helps your webhook know what was purchased
       metadata: {
-        plan: planRaw,
+        plan, // ✅ this is what your webhook writes into Supabase
         ...(email ? { email } : {}),
         ...(userId ? { userId } : {}),
       },
     });
-
-    if (!session.url) {
-      return Response.json(
-        { error: "Stripe session created but missing session.url" },
-        { status: 500, headers: corsHeaders(origin) }
-      );
-    }
 
     return Response.json(
       { url: session.url },
