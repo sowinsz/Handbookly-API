@@ -1,20 +1,76 @@
 import Stripe from "stripe";
 import { headers } from "next/headers";
-import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
 
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
+function mustEnv(name: string) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
+}
 
-function toIsoFromUnixSeconds(sec: number | null | undefined) {
-  if (!sec) return null;
-  return new Date(sec * 1000).toISOString();
+async function supabaseUpsertSubscription(row: {
+  email: string;
+  stripe_customer_id: string | null;
+  stripe_subscription_id: string | null;
+  plan: string;
+  status: string;
+  current_period_end?: string | null;
+}) {
+  const SUPABASE_URL = mustEnv("SUPABASE_URL");
+  const SERVICE_ROLE = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+
+  // Upsert by email (requires a UNIQUE constraint on email, which you likely have / want)
+  const url =
+    `${SUPABASE_URL}/rest/v1/subscriptions?on_conflict=email`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      apikey: SERVICE_ROLE,
+      Authorization: `Bearer ${SERVICE_ROLE}`,
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates,return=representation",
+    },
+    body: JSON.stringify(row),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Supabase upsert failed: ${res.status} ${text}`);
+  }
+
+  return res.json().catch(() => null);
+}
+
+async function supabaseCancelBySubscriptionId(subscriptionId: string) {
+  const SUPABASE_URL = mustEnv("SUPABASE_URL");
+  const SERVICE_ROLE = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+
+  const url =
+    `${SUPABASE_URL}/rest/v1/subscriptions?stripe_subscription_id=eq.${encodeURIComponent(subscriptionId)}`;
+
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      apikey: SERVICE_ROLE,
+      Authorization: `Bearer ${SERVICE_ROLE}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+    },
+    body: JSON.stringify({
+      status: "canceled",
+      updated_at: new Date().toISOString(),
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Supabase cancel update failed: ${res.status} ${text}`);
+  }
 }
 
 export async function POST(req: Request) {
@@ -24,8 +80,8 @@ export async function POST(req: Request) {
   if (!sig) return new Response("Missing stripe-signature", { status: 400 });
 
   const secrets = [
-    process.env.STRIPE_WEBHOOK_SECRET, // Dashboard endpoint secret (Vercel endpoint)
-    process.env.STRIPE_CLI_WEBHOOK_SECRET, // Stripe CLI listen secret
+    process.env.STRIPE_WEBHOOK_SECRET,      // Stripe dashboard endpoint secret (whsec_...)
+    process.env.STRIPE_CLI_WEBHOOK_SECRET,  // Stripe CLI listen secret (whsec_...)
   ].filter(Boolean) as string[];
 
   let event: Stripe.Event | null = null;
@@ -34,7 +90,7 @@ export async function POST(req: Request) {
   for (const secret of secrets) {
     try {
       event = stripe.webhooks.constructEvent(body, sig, secret);
-      break; // ✅ verified
+      break;
     } catch (err) {
       lastErr = err;
     }
@@ -42,148 +98,62 @@ export async function POST(req: Request) {
 
   if (!event) {
     console.error("❌ Webhook signature verification failed:", lastErr?.message);
-    return new Response(
-      `Webhook Error: ${lastErr?.message ?? "Invalid signature"}`,
-      { status: 400 }
-    );
+    return new Response(`Webhook Error: ${lastErr?.message ?? "Invalid signature"}`, {
+      status: 400,
+    });
   }
 
   console.log("✅ Stripe event verified:", event.type);
 
-  switch (event.type) {
-    /**
-     * Fired after checkout completes. Session has subscription id + email.
-     * We then fetch the Subscription to get current_period_end.
-     */
-    case "checkout.session.completed": {
-      const session = event.data.object as Stripe.Checkout.Session;
-console.log(
-  "🔍 FULL CHECKOUT SESSION PAYLOAD:",
-  JSON.stringify(session, null, 2)
-);
+  try {
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object as Stripe.Checkout.Session;
 
-      const email =
-        session.customer_details?.email ?? session.customer_email ?? null;
+        const email =
+          session.customer_details?.email ??
+          session.customer_email ??
+          null;
 
-      if (!email) {
-        console.error("❌ No email on checkout session", { sessionId: session.id });
+        if (!email) {
+          console.error("❌ No email on checkout session", { sessionId: session.id });
+          break;
+        }
+
+        const subscriptionId =
+          typeof session.subscription === "string" ? session.subscription : null;
+
+        const customerId =
+          typeof session.customer === "string" ? session.customer : null;
+
+        const plan = session.metadata?.plan ?? "unknown";
+
+        await supabaseUpsertSubscription({
+          email,
+          stripe_customer_id: customerId,
+          stripe_subscription_id: subscriptionId,
+          plan,
+          status: "active",
+          updated_at: new Date().toISOString(),
+        });
+
+        console.log("✅ Wrote/updated subscription row for:", email);
         break;
       }
 
-      const subscriptionId =
-        typeof session.subscription === "string" ? session.subscription : null;
-
-      const customerId =
-        typeof session.customer === "string" ? session.customer : null;
-
-      // Pull plan from metadata (your create-checkout-session now sets metadata.plan)
-      const plan = session.metadata?.plan ?? "unknown";
-
-      // Fetch subscription to store current_period_end
-      let currentPeriodEndIso: string | null = null;
-      let status: string = "active";
-
-      if (subscriptionId) {
-        try {
-          const sub = await stripe.subscriptions.retrieve(subscriptionId);
-          currentPeriodEndIso = toIsoFromUnixSeconds(sub.current_period_end);
-          status = sub.status ?? "active";
-        } catch (e: any) {
-          console.error("⚠️ Could not retrieve subscription:", e?.message || e);
-        }
+      case "customer.subscription.deleted": {
+        const subscription = event.data.object as Stripe.Subscription;
+        await supabaseCancelBySubscriptionId(subscription.id);
+        console.log("✅ Marked canceled for subscription:", subscription.id);
+        break;
       }
 
-      const { error } = await supabase
-        .from("subscriptions")
-        .upsert(
-          {
-            email,
-            stripe_customer_id: customerId,
-            stripe_subscription_id: subscriptionId,
-            plan,
-            status,
-            current_period_end: currentPeriodEndIso,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: "email" }
-        );
-
-      if (error) {
-        console.error("❌ Supabase upsert failed:", error);
-      } else {
-        console.log("✅ Wrote subscription row for:", email);
-      }
-
-      break;
+      default:
+        console.log("Ignoring event:", event.type);
     }
-
-    /**
-     * Keep subscription status + period end in sync on renewals, upgrades, etc.
-     */
-    case "customer.subscription.updated": {
-      const sub = event.data.object as Stripe.Subscription;
-
-      const { error } = await supabase
-        .from("subscriptions")
-        .update({
-          status: sub.status ?? "active",
-          current_period_end: toIsoFromUnixSeconds(sub.current_period_end),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("stripe_subscription_id", sub.id);
-
-      if (error) console.error("❌ Supabase update failed:", error);
-
-      break;
-    }
-
-    /**
-     * When Stripe deletes the subscription, mark canceled.
-     */
-    case "customer.subscription.deleted": {
-      const sub = event.data.object as Stripe.Subscription;
-
-      const { error } = await supabase
-        .from("subscriptions")
-        .update({
-          status: "canceled",
-          current_period_end: toIsoFromUnixSeconds(sub.current_period_end),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("stripe_subscription_id", sub.id);
-
-      if (error) console.error("❌ Supabase update failed:", error);
-
-      break;
-    }
-
-    /**
-     * Optional but useful: if payment fails, mark past_due/unpaid
-     */
-    case "invoice.payment_failed": {
-      const invoice = event.data.object as Stripe.Invoice;
-
-      const subscriptionId =
-        typeof invoice.subscription === "string" ? invoice.subscription : null;
-
-      if (subscriptionId) {
-        const { error } = await supabase
-          .from("subscriptions")
-          .update({
-            status: "past_due",
-            updated_at: new Date().toISOString(),
-          })
-          .eq("stripe_subscription_id", subscriptionId);
-
-        if (error) console.error("❌ Supabase update failed:", error);
-      }
-
-      break;
-    }
-
-    default: {
-      console.log("Ignoring event:", event.type);
-    }
+  } catch (e: any) {
+    console.error("❌ Webhook handler error:", e?.message || e);
+    // Still return 200 so Stripe doesn't endlessly retry while you're iterating
   }
 
   return new Response("ok", { status: 200 });
