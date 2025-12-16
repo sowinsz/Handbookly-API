@@ -2,8 +2,6 @@ import Stripe from "stripe";
 
 export const runtime = "nodejs";
 
-// Use the same Stripe API version as the rest of your project.
-// (Your webhook route is currently not relying on apiVersion typing, so this is fine.)
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
   apiVersion: "2023-10-16",
 });
@@ -25,20 +23,29 @@ export async function POST(req: Request) {
   const origin = req.headers.get("origin");
 
   try {
-    if (!process.env.STRIPE_SECRET_KEY) {
+    const key = process.env.STRIPE_SECRET_KEY;
+
+    if (!key) {
       return Response.json(
         { error: "Missing STRIPE_SECRET_KEY" },
         { status: 500, headers: corsHeaders(origin) }
       );
     }
 
+    // Helpful sanity check: tells you if you're using test or live key
+    const keyMode = key.startsWith("sk_test_")
+      ? "test"
+      : key.startsWith("sk_live_")
+      ? "live"
+      : "unknown";
+
     const body = await req.json().catch(() => null);
 
     const planRaw = (body?.plan ?? "").toString().toLowerCase();
     const plan = planRaw as "pro" | "business";
 
-    const successUrl = body?.successUrl as string | undefined;
-    const cancelUrl = body?.cancelUrl as string | undefined;
+    const successUrl = body?.successUrl ? String(body.successUrl) : undefined;
+    const cancelUrl = body?.cancelUrl ? String(body.cancelUrl) : undefined;
 
     // Optional (email-first now, userId later)
     const userId = body?.userId ? String(body.userId) : undefined;
@@ -74,28 +81,45 @@ export async function POST(req: Request) {
       );
     }
 
+    // Tripwire: MUST be a Stripe Price ID, not a Product ID
+    if (!price.startsWith("price_")) {
+      return Response.json(
+        {
+          error: "Invalid price ID configured",
+          detail: `Expected a Stripe Price ID starting with "price_" but got: ${price}`,
+          hint:
+            "In Vercel env vars, NEXT_PUBLIC_STRIPE_*_PRICE_ID must be price_..., not prod_...",
+        },
+        { status: 500, headers: corsHeaders(origin) }
+      );
+    }
+
+    // Optional verification (super useful for debugging):
+    // If the price doesn't exist in THIS Stripe account/mode, this will throw.
+    const retrievedPrice = await stripe.prices.retrieve(price);
+
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
-      line_items: [{ price, quantity: 1 }],
+      line_items: [{ price: retrievedPrice.id, quantity: 1 }],
       success_url: successUrl,
       cancel_url: cancelUrl,
 
-      // Email-first (good now)
       customer_email: email || undefined,
-
-      // Upgrade path to userId later (good to keep)
       client_reference_id: userId || undefined,
 
-      // Make webhook/DB logic reliable
       metadata: {
         plan: String(plan),
         ...(email ? { email } : {}),
         ...(userId ? { userId } : {}),
+        keyMode, // "test" or "live" (handy to see in webhook metadata)
       },
     });
 
     return Response.json(
-      { url: session.url },
+      {
+        url: session.url,
+        debug: { keyMode, priceUsed: retrievedPrice.id },
+      },
       { status: 200, headers: corsHeaders(origin) }
     );
   } catch (err: any) {
@@ -105,4 +129,5 @@ export async function POST(req: Request) {
     );
   }
 }
+
 
