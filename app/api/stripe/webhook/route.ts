@@ -19,7 +19,9 @@ async function supabaseUpsertSubscription(row: {
   plan: string;
   status: string;
   current_period_end?: string | null;
+  updated_at?: string | null;
 }) {
+
   const SUPABASE_URL = mustEnv("SUPABASE_URL");
   const SERVICE_ROLE = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
 
