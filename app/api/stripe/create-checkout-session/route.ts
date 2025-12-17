@@ -79,20 +79,31 @@ export async function POST(req: Request) {
     }
 
     const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      line_items: [{ price, quantity: 1 }],
-      success_url: successUrl,
-      cancel_url: cancelUrl,
+  mode: "subscription",
+  line_items: [{ price, quantity: 1 }],
+  success_url: successUrl,
+  cancel_url: cancelUrl,
 
-      customer_email: email || undefined,
-      client_reference_id: userId || undefined,
+  customer_email: email || undefined,
+  client_reference_id: userId || undefined,
 
-      metadata: {
-        plan, // ✅ this is what your webhook writes into Supabase
-        ...(email ? { email } : {}),
-        ...(userId ? { userId } : {}),
-      },
-    });
+  // ✅ Session metadata (used by checkout.session.completed)
+  metadata: {
+    plan,
+    ...(email ? { email } : {}),
+    ...(userId ? { userId } : {}),
+  },
+
+  // ✅ Subscription metadata (used by customer.subscription.updated)
+  subscription_data: {
+    metadata: {
+      plan,
+      ...(email ? { email } : {}),
+      ...(userId ? { userId } : {}),
+    },
+  },
+})
+
 
     return Response.json(
       { url: session.url },
