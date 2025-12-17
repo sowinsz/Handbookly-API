@@ -78,7 +78,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const session = await stripe.checkout.sessions.create({
+ const session = await stripe.checkout.sessions.create({
   mode: "subscription",
   line_items: [{ price, quantity: 1 }],
   success_url: successUrl,
@@ -87,14 +87,14 @@ export async function POST(req: Request) {
   customer_email: email || undefined,
   client_reference_id: userId || undefined,
 
-  // ✅ Session metadata (used by checkout.session.completed)
+  // Metadata on the CHECKOUT SESSION (optional but fine)
   metadata: {
     plan,
     ...(email ? { email } : {}),
     ...(userId ? { userId } : {}),
   },
 
-  // ✅ Subscription metadata (used by customer.subscription.updated)
+  // 🔑 THIS IS THE IMPORTANT PART
   subscription_data: {
     metadata: {
       plan,
@@ -102,7 +102,8 @@ export async function POST(req: Request) {
       ...(userId ? { userId } : {}),
     },
   },
-})
+});
+
 
 
     return Response.json(
