@@ -1,233 +1,159 @@
-import Stripe from "stripe";
-import { headers } from "next/headers";
+import Stripe from "stripe"
+import { headers } from "next/headers"
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+export const runtime = "nodejs"
+export const dynamic = "force-dynamic"
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
+  apiVersion: "2023-10-16",
+})
 
 function mustEnv(name: string) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
+  const v = process.env[name]
+  if (!v) throw new Error(`Missing env var: ${name}`)
+  return v
 }
 
-async function supabaseUpsertSubscription(row: {
-  email: string;
-  stripe_customer_id: string | null;
-  stripe_subscription_id: string | null;
-  plan: string;
-  status: string;
-  current_period_end?: string | null;
-  updated_at?: string | null;
-}) {
-  const SUPABASE_URL = mustEnv("SUPABASE_URL");
-  const SERVICE_ROLE = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+async function supabaseRequest(pathAndQuery: string, method: string, body?: any) {
+  const SUPABASE_URL = mustEnv("SUPABASE_URL")
+  const SERVICE_ROLE = mustEnv("SUPABASE_SERVICE_ROLE_KEY")
 
-  // Upsert by email (requires a UNIQUE constraint on email)
-  const url = `${SUPABASE_URL}/rest/v1/subscriptions?on_conflict=email`;
+  const url = `${SUPABASE_URL}/rest/v1/${pathAndQuery}`
 
   const res = await fetch(url, {
-    method: "POST",
+    method,
     headers: {
       apikey: SERVICE_ROLE,
       Authorization: `Bearer ${SERVICE_ROLE}`,
       "Content-Type": "application/json",
       Prefer: "resolution=merge-duplicates,return=representation",
     },
-    body: JSON.stringify(row),
-  });
+    body: body ? JSON.stringify(body) : undefined,
+  })
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Supabase upsert failed: ${res.status} ${text}`);
+    const text = await res.text()
+    throw new Error(`Supabase request failed: ${res.status} ${text}`)
   }
 
-  return res.json().catch(() => null);
+  return res.json().catch(() => null)
 }
 
-async function supabaseCancelBySubscriptionId(subscriptionId: string) {
-  const SUPABASE_URL = mustEnv("SUPABASE_URL");
-  const SERVICE_ROLE = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
-
-  const url = `${SUPABASE_URL}/rest/v1/subscriptions?stripe_subscription_id=eq.${encodeURIComponent(
-    subscriptionId
-  )}`;
-
-  const res = await fetch(url, {
-    method: "PATCH",
-    headers: {
-      apikey: SERVICE_ROLE,
-      Authorization: `Bearer ${SERVICE_ROLE}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify({
-      status: "canceled",
-      updated_at: new Date().toISOString(),
-    }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Supabase cancel update failed: ${res.status} ${text}`);
-  }
-
-  return res.json().catch(() => null);
+async function upsertSubscription(row: {
+  email: string
+  stripe_customer_id: string | null
+  stripe_subscription_id: string | null
+  plan: string
+  status: string
+  updated_at: string
+}) {
+  // upsert by email
+  return supabaseRequest(`subscriptions?on_conflict=email`, "POST", row)
 }
 
-/**
- * ✅ NEW: Update the user's plan in profiles so the Dashboard reflects upgrades.
- * This assumes your `profiles` table has columns:
- * - id (uuid) [matches Supabase auth user id]
- * - plan (text)
- * - updated_at (optional; safe if exists)
- */
-async function supabaseUpdateProfilePlanByUserId(userId: string, plan: string) {
-  const SUPABASE_URL = mustEnv("SUPABASE_URL");
-  const SERVICE_ROLE = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+async function updateProfilePlanByUserId(userId: string, plan: string) {
+  // PATCH where id = userId
+  await supabaseRequest(`profiles?id=eq.${encodeURIComponent(userId)}`, "PATCH", {
+    plan,
+  })
+}
 
-  const url = `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(
-    userId
-  )}`;
-
-  const res = await fetch(url, {
-    method: "PATCH",
-    headers: {
-      apikey: SERVICE_ROLE,
-      Authorization: `Bearer ${SERVICE_ROLE}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify({
-      plan, // "starter" | "growth" | "business"
-      updated_at: new Date().toISOString(),
-    }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(
-      `Supabase profile plan update failed: ${res.status} ${text}`
-    );
-  }
-
-  return res.json().catch(() => null);
+async function updateProfilePlanByEmail(email: string, plan: string) {
+  // PATCH where email = email
+  await supabaseRequest(`profiles?email=eq.${encodeURIComponent(email)}`, "PATCH", {
+    plan,
+  })
 }
 
 export async function POST(req: Request) {
-  const sig = headers().get("stripe-signature");
-  const body = await req.text();
+  const sig = headers().get("stripe-signature")
+  const body = await req.text()
 
-  if (!sig) return new Response("Missing stripe-signature", { status: 400 });
+  if (!sig) return new Response("Missing stripe-signature", { status: 400 })
 
-  const secrets = [
-    process.env.STRIPE_WEBHOOK_SECRET, // Stripe dashboard endpoint secret (whsec_...)
-    process.env.STRIPE_CLI_WEBHOOK_SECRET, // Stripe CLI listen secret (whsec_...)
-  ].filter(Boolean) as string[];
-
-  let event: Stripe.Event | null = null;
-  let lastErr: any = null;
-
-  for (const secret of secrets) {
-    try {
-      event = stripe.webhooks.constructEvent(body, sig, secret);
-      break;
-    } catch (err) {
-      lastErr = err;
-    }
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET
+  if (!webhookSecret) {
+    console.error("❌ Missing STRIPE_WEBHOOK_SECRET")
+    return new Response("Missing STRIPE_WEBHOOK_SECRET", { status: 500 })
   }
 
-  if (!event) {
-    console.error("❌ Webhook signature verification failed:", lastErr?.message);
-    return new Response(
-      `Webhook Error: ${lastErr?.message ?? "Invalid signature"}`,
-      { status: 400 }
-    );
+  let event: Stripe.Event
+  try {
+    event = stripe.webhooks.constructEvent(body, sig, webhookSecret)
+  } catch (err: any) {
+    console.error("❌ Webhook signature verification failed:", err?.message || err)
+    return new Response(`Webhook Error: ${err?.message ?? "Invalid signature"}`, {
+      status: 400,
+    })
   }
-
-  console.log("✅ Stripe event verified:", event.type);
 
   try {
-    switch (event.type) {
-      case "checkout.session.completed": {
-        const session = event.data.object as Stripe.Checkout.Session;
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object as Stripe.Checkout.Session
 
-        const email =
-          session.customer_details?.email ?? session.customer_email ?? null;
+      const email =
+        session.customer_details?.email ??
+        session.customer_email ??
+        session.metadata?.email ??
+        null
 
-        const subscriptionId =
-          typeof session.subscription === "string" ? session.subscription : null;
+      const userId =
+        (typeof session.client_reference_id === "string" && session.client_reference_id) ||
+        session.metadata?.userId ||
+        null
 
-        const customerId =
-          typeof session.customer === "string" ? session.customer : null;
+      const plan = (session.metadata?.plan || "unknown").toLowerCase()
 
-        const plan = (session.metadata?.plan ?? "unknown").toLowerCase();
+      const subscriptionId =
+        typeof session.subscription === "string" ? session.subscription : null
 
-        // ✅ Get the Supabase auth user id (passed from your checkout creation route)
-        const userId =
-          session.client_reference_id ?? session.metadata?.userId ?? null;
+      const customerId =
+        typeof session.customer === "string" ? session.customer : null
 
-        if (!email) {
-          console.error("❌ No email on checkout session", {
-            sessionId: session.id,
-          });
-          // We can still try to update profile if we have userId, but subscriptions upsert needs email.
-        }
-
-        if (!userId) {
-          console.error(
-            "❌ No userId on checkout session (client_reference_id/metadata.userId missing)",
-            { sessionId: session.id }
-          );
-          break;
-        }
-
-        // 1) Update subscriptions table (your existing behavior)
-        if (email) {
-          await supabaseUpsertSubscription({
-            email,
-            stripe_customer_id: customerId,
-            stripe_subscription_id: subscriptionId,
-            plan,
-            status: "active",
-            updated_at: new Date().toISOString(),
-          });
-
-          console.log("✅ Wrote/updated subscription row for:", email);
-        } else {
-          console.log(
-            "⚠️ Skipped subscriptions upsert because email was missing (but will still update profiles.plan)."
-          );
-        }
-
-        // 2) ✅ Update profiles.plan so the Dashboard shows the new plan
-        await supabaseUpdateProfilePlanByUserId(userId, plan);
-        console.log("✅ Updated profiles.plan for userId:", userId, "->", plan);
-
-        break;
+      if (!email) {
+        console.error("❌ No email on checkout session", { sessionId: session.id })
+        return new Response("ok", { status: 200 })
       }
 
-      case "customer.subscription.deleted": {
-        const subscription = event.data.object as Stripe.Subscription;
-        await supabaseCancelBySubscriptionId(subscription.id);
-        console.log("✅ Marked canceled for subscription:", subscription.id);
-        break;
+      // 1) write subscriptions table (your existing billing table)
+      await upsertSubscription({
+        email,
+        stripe_customer_id: customerId,
+        stripe_subscription_id: subscriptionId,
+        plan,
+        status: "active",
+        updated_at: new Date().toISOString(),
+      })
+
+      // 2) ✅ update profiles.plan so dashboard unlocks
+      // Prefer userId (most reliable). Fallback to email.
+      if (userId) {
+        await updateProfilePlanByUserId(userId, plan)
+      } else {
+        await updateProfilePlanByEmail(email, plan)
       }
 
-      default:
-        console.log("Ignoring event:", event.type);
+      console.log("✅ checkout.session.completed -> updated subscription + profile", {
+        email,
+        userId,
+        plan,
+      })
     }
+
+    // Optional: if you later support upgrades via portal, also handle subscription updates here.
+    // if (event.type === "customer.subscription.updated") { ... }
+
   } catch (e: any) {
-    console.error("❌ Webhook handler error:", e?.message || e);
-    // Still return 200 so Stripe doesn't endlessly retry while you're iterating
+    console.error("❌ Webhook handler error:", e?.message || e)
+    // Return 200 to avoid endless retries while iterating
   }
 
-  return new Response("ok", { status: 200 });
+  return new Response("ok", { status: 200 })
 }
 
 export async function GET() {
-  return new Response("Method Not Allowed", { status: 405 });
+  return new Response("Method Not Allowed", { status: 405 })
 }
+
 
 
