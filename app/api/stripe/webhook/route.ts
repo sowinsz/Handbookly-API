@@ -14,7 +14,7 @@ function mustEnv(name: string) {
   return v
 }
 
-async function supabaseRequest(pathAndQuery: string, method: string, body?: any) {
+async function supabaseFetch(pathAndQuery: string, method: string, body?: any) {
   const SUPABASE_URL = mustEnv("SUPABASE_URL")
   const SERVICE_ROLE = mustEnv("SUPABASE_SERVICE_ROLE_KEY")
 
@@ -39,30 +39,45 @@ async function supabaseRequest(pathAndQuery: string, method: string, body?: any)
   return res.json().catch(() => null)
 }
 
+// Upsert into public.subscriptions by email (matches your current approach)
 async function upsertSubscription(row: {
   email: string
   stripe_customer_id: string | null
   stripe_subscription_id: string | null
   plan: string
   status: string
-  updated_at: string
+  current_period_end?: string | null
 }) {
-  // upsert by email
-  return supabaseRequest(`subscriptions?on_conflict=email`, "POST", row)
+  return supabaseFetch(`subscriptions?on_conflict=email`, "POST", {
+    ...row,
+    updated_at: new Date().toISOString(), // ✅ subscriptions can have updated_at; ok if column exists
+  })
 }
 
-async function updateProfilePlanByUserId(userId: string, plan: string) {
-  // PATCH where id = userId
-  await supabaseRequest(`profiles?id=eq.${encodeURIComponent(userId)}`, "PATCH", {
+// ✅ Update profiles.plan ONLY (no updated_at)
+async function updateProfilePlanById(userId: string, plan: string) {
+  await supabaseFetch(`profiles?id=eq.${encodeURIComponent(userId)}`, "PATCH", {
     plan,
   })
 }
 
+// Fallback if userId missing
 async function updateProfilePlanByEmail(email: string, plan: string) {
-  // PATCH where email = email
-  await supabaseRequest(`profiles?email=eq.${encodeURIComponent(email)}`, "PATCH", {
+  await supabaseFetch(`profiles?email=eq.${encodeURIComponent(email)}`, "PATCH", {
     plan,
   })
+}
+
+async function cancelSubscriptionById(subscriptionId: string) {
+  // Mark subscription canceled (does not touch profiles here)
+  await supabaseFetch(
+    `subscriptions?stripe_subscription_id=eq.${encodeURIComponent(subscriptionId)}`,
+    "PATCH",
+    {
+      status: "canceled",
+      updated_at: new Date().toISOString(),
+    }
+  )
 }
 
 export async function POST(req: Request) {
@@ -71,11 +86,7 @@ export async function POST(req: Request) {
 
   if (!sig) return new Response("Missing stripe-signature", { status: 400 })
 
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET
-  if (!webhookSecret) {
-    console.error("❌ Missing STRIPE_WEBHOOK_SECRET")
-    return new Response("Missing STRIPE_WEBHOOK_SECRET", { status: 500 })
-  }
+  const webhookSecret = mustEnv("STRIPE_WEBHOOK_SECRET")
 
   let event: Stripe.Event
   try {
@@ -87,65 +98,74 @@ export async function POST(req: Request) {
     })
   }
 
+  console.log("✅ Stripe event verified:", event.type)
+
   try {
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object as Stripe.Checkout.Session
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object as Stripe.Checkout.Session
 
-      const email =
-        session.customer_details?.email ??
-        session.customer_email ??
-        session.metadata?.email ??
-        null
+        const email =
+          session.customer_details?.email ??
+          session.customer_email ??
+          session.metadata?.email ??
+          null
 
-      const userId =
-        (typeof session.client_reference_id === "string" && session.client_reference_id) ||
-        session.metadata?.userId ||
-        null
+        const userId =
+          (typeof session.client_reference_id === "string" &&
+            session.client_reference_id) ||
+          session.metadata?.userId ||
+          null
 
-      const plan = (session.metadata?.plan || "unknown").toLowerCase()
+        const plan = String(session.metadata?.plan || "unknown").toLowerCase()
 
-      const subscriptionId =
-        typeof session.subscription === "string" ? session.subscription : null
+        const subscriptionId =
+          typeof session.subscription === "string" ? session.subscription : null
 
-      const customerId =
-        typeof session.customer === "string" ? session.customer : null
+        const customerId =
+          typeof session.customer === "string" ? session.customer : null
 
-      if (!email) {
-        console.error("❌ No email on checkout session", { sessionId: session.id })
-        return new Response("ok", { status: 200 })
+        if (!email) {
+          console.error("❌ No email on checkout session", { sessionId: session.id })
+          break
+        }
+
+        // 1) Write/merge subscriptions row
+        await upsertSubscription({
+          email,
+          stripe_customer_id: customerId,
+          stripe_subscription_id: subscriptionId,
+          plan,
+          status: "active",
+        })
+
+        console.log("✅ Wrote/updated subscription row for:", email)
+
+        // 2) ✅ Unlock dashboard by updating profiles.plan (NO updated_at)
+        if (userId) {
+          await updateProfilePlanById(userId, plan)
+          console.log("✅ Updated profiles.plan by id:", userId, plan)
+        } else {
+          await updateProfilePlanByEmail(email, plan)
+          console.log("✅ Updated profiles.plan by email:", email, plan)
+        }
+
+        break
       }
 
-      // 1) write subscriptions table (your existing billing table)
-      await upsertSubscription({
-        email,
-        stripe_customer_id: customerId,
-        stripe_subscription_id: subscriptionId,
-        plan,
-        status: "active",
-        updated_at: new Date().toISOString(),
-      })
-
-      // 2) ✅ update profiles.plan so dashboard unlocks
-      // Prefer userId (most reliable). Fallback to email.
-      if (userId) {
-        await updateProfilePlanByUserId(userId, plan)
-      } else {
-        await updateProfilePlanByEmail(email, plan)
+      case "customer.subscription.deleted": {
+        const subscription = event.data.object as Stripe.Subscription
+        await cancelSubscriptionById(subscription.id)
+        console.log("✅ Marked canceled for subscription:", subscription.id)
+        break
       }
 
-      console.log("✅ checkout.session.completed -> updated subscription + profile", {
-        email,
-        userId,
-        plan,
-      })
+      default:
+        console.log("Ignoring event:", event.type)
     }
-
-    // Optional: if you later support upgrades via portal, also handle subscription updates here.
-    // if (event.type === "customer.subscription.updated") { ... }
-
   } catch (e: any) {
     console.error("❌ Webhook handler error:", e?.message || e)
-    // Return 200 to avoid endless retries while iterating
+    // Return 200 so Stripe doesn't keep retrying while you're iterating
   }
 
   return new Response("ok", { status: 200 })
