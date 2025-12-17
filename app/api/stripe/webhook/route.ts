@@ -39,9 +39,9 @@ async function supabaseFetch(pathAndQuery: string, method: string, body?: any) {
   return res.json().catch(() => null)
 }
 
-// Upsert into public.subscriptions by email (matches your current approach)
 async function upsertSubscription(row: {
   email: string
+  user_id?: string | null
   stripe_customer_id: string | null
   stripe_subscription_id: string | null
   plan: string
@@ -50,40 +50,34 @@ async function upsertSubscription(row: {
 }) {
   return supabaseFetch(`subscriptions?on_conflict=email`, "POST", {
     ...row,
-    updated_at: new Date().toISOString(), // ✅ subscriptions can have updated_at; ok if column exists
+    updated_at: new Date().toISOString(),
   })
 }
 
-// ✅ Update profiles.plan ONLY (no updated_at)
 async function updateProfilePlanById(userId: string, plan: string) {
   await supabaseFetch(`profiles?id=eq.${encodeURIComponent(userId)}`, "PATCH", {
     plan,
   })
 }
 
-// Fallback if userId missing
 async function updateProfilePlanByEmail(email: string, plan: string) {
   await supabaseFetch(`profiles?email=eq.${encodeURIComponent(email)}`, "PATCH", {
     plan,
   })
 }
 
-async function cancelSubscriptionById(subscriptionId: string) {
-  // Mark subscription canceled (does not touch profiles here)
-  await supabaseFetch(
-    `subscriptions?stripe_subscription_id=eq.${encodeURIComponent(subscriptionId)}`,
-    "PATCH",
-    {
-      status: "canceled",
-      updated_at: new Date().toISOString(),
-    }
-  )
+// Helper: when unpaid/canceled, lock them
+async function lockUser(userIdOrEmail: { userId?: string | null; email?: string | null }) {
+  if (userIdOrEmail.userId) {
+    await updateProfilePlanById(userIdOrEmail.userId, "pending")
+  } else if (userIdOrEmail.email) {
+    await updateProfilePlanByEmail(userIdOrEmail.email, "pending")
+  }
 }
 
 export async function POST(req: Request) {
   const sig = headers().get("stripe-signature")
   const body = await req.text()
-
   if (!sig) return new Response("Missing stripe-signature", { status: 400 })
 
   const webhookSecret = mustEnv("STRIPE_WEBHOOK_SECRET")
@@ -93,9 +87,7 @@ export async function POST(req: Request) {
     event = stripe.webhooks.constructEvent(body, sig, webhookSecret)
   } catch (err: any) {
     console.error("❌ Webhook signature verification failed:", err?.message || err)
-    return new Response(`Webhook Error: ${err?.message ?? "Invalid signature"}`, {
-      status: 400,
-    })
+    return new Response(`Webhook Error: ${err?.message ?? "Invalid signature"}`, { status: 400 })
   }
 
   console.log("✅ Stripe event verified:", event.type)
@@ -112,8 +104,7 @@ export async function POST(req: Request) {
           null
 
         const userId =
-          (typeof session.client_reference_id === "string" &&
-            session.client_reference_id) ||
+          (typeof session.client_reference_id === "string" && session.client_reference_id) ||
           session.metadata?.userId ||
           null
 
@@ -125,38 +116,110 @@ export async function POST(req: Request) {
         const customerId =
           typeof session.customer === "string" ? session.customer : null
 
-        if (!email) {
-          console.error("❌ No email on checkout session", { sessionId: session.id })
-          break
-        }
+        if (!email) break
 
-        // 1) Write/merge subscriptions row
         await upsertSubscription({
           email,
+          user_id: userId,
           stripe_customer_id: customerId,
           stripe_subscription_id: subscriptionId,
           plan,
           status: "active",
         })
 
-        console.log("✅ Wrote/updated subscription row for:", email)
+        if (userId) await updateProfilePlanById(userId, plan)
+        else await updateProfilePlanByEmail(email, plan)
 
-        // 2) ✅ Unlock dashboard by updating profiles.plan (NO updated_at)
-        if (userId) {
-          await updateProfilePlanById(userId, plan)
-          console.log("✅ Updated profiles.plan by id:", userId, plan)
+        break
+      }
+
+      // ✅ Plan changes, cancellations at period end, etc.
+      case "customer.subscription.updated": {
+        const sub = event.data.object as Stripe.Subscription
+
+        const customerId = typeof sub.customer === "string" ? sub.customer : null
+        const subscriptionId = sub.id
+
+        // Best: use metadata stored on the subscription (set it when creating checkout)
+        const plan = String((sub.metadata as any)?.plan || "unknown").toLowerCase()
+        const status = sub.status
+
+        // Find user via subscriptions table (by stripe_subscription_id)
+        const rows = await supabaseFetch(
+          `subscriptions?stripe_subscription_id=eq.${encodeURIComponent(subscriptionId)}&select=email,user_id`,
+          "GET"
+        )
+
+        const email = rows?.[0]?.email ?? null
+        const userId = rows?.[0]?.user_id ?? null
+
+        await supabaseFetch(
+          `subscriptions?stripe_subscription_id=eq.${encodeURIComponent(subscriptionId)}`,
+          "PATCH",
+          {
+            stripe_customer_id: customerId,
+            plan,
+            status,
+            updated_at: new Date().toISOString(),
+          }
+        )
+
+        // If still active, keep plan; if not active, lock
+        if (status === "active" || status === "trialing") {
+          if (userId) await updateProfilePlanById(userId, plan)
+          else if (email) await updateProfilePlanByEmail(email, plan)
         } else {
-          await updateProfilePlanByEmail(email, plan)
-          console.log("✅ Updated profiles.plan by email:", email, plan)
+          await lockUser({ userId, email })
         }
 
         break
       }
 
+      // ✅ Payment failed -> lock access
+      case "invoice.payment_failed": {
+        const invoice = event.data.object as Stripe.Invoice
+        const subscriptionId =
+          typeof invoice.subscription === "string" ? invoice.subscription : null
+        if (!subscriptionId) break
+
+        const rows = await supabaseFetch(
+          `subscriptions?stripe_subscription_id=eq.${encodeURIComponent(subscriptionId)}&select=email,user_id`,
+          "GET"
+        )
+
+        const email = rows?.[0]?.email ?? null
+        const userId = rows?.[0]?.user_id ?? null
+
+        await supabaseFetch(
+          `subscriptions?stripe_subscription_id=eq.${encodeURIComponent(subscriptionId)}`,
+          "PATCH",
+          { status: "past_due", updated_at: new Date().toISOString() }
+        )
+
+        await lockUser({ userId, email })
+        break
+      }
+
+      // ✅ Subscription ended -> lock access
       case "customer.subscription.deleted": {
         const subscription = event.data.object as Stripe.Subscription
-        await cancelSubscriptionById(subscription.id)
-        console.log("✅ Marked canceled for subscription:", subscription.id)
+        const subscriptionId = subscription.id
+
+        const rows = await supabaseFetch(
+          `subscriptions?stripe_subscription_id=eq.${encodeURIComponent(subscriptionId)}&select=email,user_id`,
+          "GET"
+        )
+
+        const email = rows?.[0]?.email ?? null
+        const userId = rows?.[0]?.user_id ?? null
+
+        await supabaseFetch(
+          `subscriptions?stripe_subscription_id=eq.${encodeURIComponent(subscriptionId)}`,
+          "PATCH",
+          { status: "canceled", updated_at: new Date().toISOString() }
+        )
+
+        await lockUser({ userId, email })
         break
       }
 
@@ -165,7 +228,6 @@ export async function POST(req: Request) {
     }
   } catch (e: any) {
     console.error("❌ Webhook handler error:", e?.message || e)
-    // Return 200 so Stripe doesn't keep retrying while you're iterating
   }
 
   return new Response("ok", { status: 200 })
@@ -174,6 +236,7 @@ export async function POST(req: Request) {
 export async function GET() {
   return new Response("Method Not Allowed", { status: 405 })
 }
+
 
 
 
