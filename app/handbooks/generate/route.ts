@@ -2,9 +2,6 @@ import { NextResponse } from "next/server"
 import OpenAI from "openai"
 import { createClient } from "@supabase/supabase-js"
 
-export const runtime = "nodejs"
-
-// 🔐 Env vars (set these in Vercel too)
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
 })
@@ -14,101 +11,96 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 )
 
-// 🌍 CORS helper
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  }
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
 }
 
-// ✅ Required for preflight
 export async function OPTIONS() {
-  return NextResponse.json({}, { headers: corsHeaders() })
+  return new Response(null, { headers: corsHeaders })
 }
 
 export async function POST(req: Request) {
   try {
     const body = await req.json()
-
     const {
       handbookId,
-      userId,
       templateId,
       companyName,
       state,
       tone,
     } = body
 
-    if (!handbookId || !userId) {
+    if (!handbookId) {
       return NextResponse.json(
-        { error: "Missing handbookId or userId" },
-        { status: 400, headers: corsHeaders() }
+        { error: "Missing handbookId" },
+        { status: 400, headers: corsHeaders }
       )
     }
 
     const prompt = `
-Write a professional employee handbook in Markdown.
+You are an HR compliance expert.
 
+Write a full employee handbook in Markdown format.
+
+Template: ${templateId || "Employee Handbook"}
 Company: ${companyName || "The Company"}
 State: ${state || "United States"}
 Tone: ${tone || "Friendly"}
 
-Include sections for:
-- Introduction
+Include:
+- Welcome
 - Employment policies
 - Code of conduct
 - Benefits
 - Time off
-- Compliance disclaimer
-
-Use clear headings and bullet points.
+- Legal disclaimers
 `
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
+      messages: [
+        { role: "system", content: "You write professional employee handbooks." },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.4,
     })
 
     const content_md =
-      completion.choices[0]?.message?.content?.trim() || ""
+      completion.choices[0]?.message?.content || ""
 
     if (!content_md) {
       return NextResponse.json(
         { error: "AI returned empty content" },
-        { status: 500, headers: corsHeaders() }
+        { status: 500, headers: corsHeaders }
       )
     }
 
-    // 💾 Save to Supabase
-    const { error: updateError } = await supabase
+    const { error } = await supabase
       .from("handbooks")
       .update({
         content_md,
         template_id: templateId || null,
-        status: "draft",
       })
       .eq("id", handbookId)
-      .eq("user_id", userId)
 
-    if (updateError) {
-      console.error(updateError)
+    if (error) {
       return NextResponse.json(
-        { error: "Failed to save handbook" },
-        { status: 500, headers: corsHeaders() }
+        { error: error.message },
+        { status: 500, headers: corsHeaders }
       )
     }
 
     return NextResponse.json(
       { content_md },
-      { headers: corsHeaders() }
+      { headers: corsHeaders }
     )
-  } catch (err) {
-    console.error(err)
+  } catch (err: any) {
     return NextResponse.json(
-      { error: "Internal server error" },
-      { status: 500, headers: corsHeaders() }
+      { error: err.message || "Unexpected error" },
+      { status: 500, headers: corsHeaders }
     )
   }
 }
+
