@@ -4,7 +4,6 @@ import { createClient } from "@supabase/supabase-js"
 
 /**
  * ENV VARS REQUIRED IN VERCEL
- *
  * OPENAI_API_KEY
  * SUPABASE_URL
  * SUPABASE_SERVICE_ROLE_KEY
@@ -43,14 +42,15 @@ export async function POST(req: Request) {
     }
 
     // --- PARSE BODY ---
-    const body = await req.json()
-    const {
-      handbookId,
-      templateId,
-      companyName,
-      state,
-      tone,
-    } = body
+    const body = await req.json().catch(() => null)
+    if (!body) {
+      return NextResponse.json(
+        { error: "Invalid JSON body" },
+        { status: 400, headers: corsHeaders }
+      )
+    }
+
+    const { handbookId, templateId, companyName, state, tone } = body
 
     if (!handbookId) {
       return NextResponse.json(
@@ -61,7 +61,6 @@ export async function POST(req: Request) {
 
     // --- INIT CLIENTS ---
     const openai = new OpenAI({ apiKey: openaiKey })
-
     const supabase = createClient(supabaseUrl, supabaseKey)
 
     // --- PROMPT ---
@@ -92,10 +91,8 @@ Use clear headings and professional formatting.
       input: prompt,
     })
 
-    const content =
-      response.output_text ||
-      response.output?.[0]?.content?.[0]?.text ||
-      ""
+    // ✅ FIX: only use output_text (avoid typed output parsing)
+    const content = String(response.output_text || "")
 
     if (!content.trim()) {
       return NextResponse.json(
@@ -121,7 +118,6 @@ Use clear headings and professional formatting.
       )
     }
 
-    // --- SUCCESS ---
     return NextResponse.json(
       { content_md: content },
       { status: 200, headers: corsHeaders }
