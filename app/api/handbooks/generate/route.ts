@@ -2,131 +2,182 @@ import { NextResponse } from "next/server"
 import OpenAI from "openai"
 import { createClient } from "@supabase/supabase-js"
 
-/**
- * ENV VARS REQUIRED IN VERCEL (server-side):
- * - OPENAI_API_KEY
- * - SUPABASE_URL
- * - SUPABASE_SERVICE_ROLE_KEY
- *
- * Note: These are SERVER env vars. They do NOT need NEXT_PUBLIC_ prefixes.
- */
+export const runtime = "nodejs"
+// Helps avoid any caching weirdness on serverless routes
+export const dynamic = "force-dynamic"
 
-// --- CORS ---
-const corsHeaders: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+function corsHeaders(origin: string | null) {
+  // Allow all origins for now (easiest while building).
+  // You can lock this down later to: https://delicious-way-228843.framer.app
+  return {
+    "Access-Control-Allow-Origin": origin || "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Vary": "Origin",
+  }
 }
 
-// Preflight
-export async function OPTIONS() {
-  return new NextResponse(null, { status: 204, headers: corsHeaders })
+// Preflight handler (this is what your browser is complaining about)
+export async function OPTIONS(req: Request) {
+  const origin = req.headers.get("origin")
+  return new NextResponse(null, {
+    status: 204,
+    headers: corsHeaders(origin),
+  })
 }
 
-function jsonResponse(body: any, status = 200) {
-  return NextResponse.json(body, { status, headers: corsHeaders })
-}
-
-function requireEnv(name: string) {
-  const v = process.env[name]
-  if (!v || !String(v).trim()) throw new Error(`${name} is required.`)
-  return v
-}
-
-type GenerateBody = {
+type Body = {
   handbookId: string
   userId?: string | null
-  templateId?: string | null
+  templateId?: string
   companyName?: string | null
   state?: string | null
-  tone?: string | null
+  tone?: string
+}
+
+function isUuid(v: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    v
+  )
 }
 
 export async function POST(req: Request) {
+  const origin = req.headers.get("origin")
+
   try {
-    // Read env (do this inside handler so Vercel build doesn’t crash)
-    const OPENAI_API_KEY = requireEnv("OPENAI_API_KEY")
-    const SUPABASE_URL = requireEnv("SUPABASE_URL")
-    const SUPABASE_SERVICE_ROLE_KEY = requireEnv("SUPABASE_SERVICE_ROLE_KEY")
+    const supabaseUrl = process.env.SUPABASE_URL
+    const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+    const openaiKey = process.env.OPENAI_API_KEY
 
-    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-      auth: { persistSession: false },
-    })
-
-    const openai = new OpenAI({ apiKey: OPENAI_API_KEY })
-
-    const body = (await req.json().catch(() => null)) as GenerateBody | null
-    if (!body) return jsonResponse({ error: "Invalid JSON body." }, 400)
-
-    const handbookId = String(body.handbookId || "").trim()
-    if (!handbookId) return jsonResponse({ error: "handbookId is required." }, 400)
-
-    const templateId = String(body.templateId || "employee").trim()
-    const companyName = (body.companyName ?? "").toString().trim() || "your company"
-    const state = (body.state ?? "").toString().trim() || "your state"
-    const tone = (body.tone ?? "Friendly").toString().trim() || "Friendly"
-
-    // Optional ownership check (only if userId is provided)
-    if (body.userId) {
-      const { data: hb, error: hbErr } = await supabase
-        .from("handbooks")
-        .select("id, user_id")
-        .eq("id", handbookId)
-        .maybeSingle()
-
-      if (hbErr) return jsonResponse({ error: hbErr.message }, 400)
-      if (!hb) return jsonResponse({ error: "Handbook not found." }, 404)
-      if (hb.user_id && hb.user_id !== body.userId) {
-        return jsonResponse({ error: "Not authorized for this handbook." }, 403)
-      }
+    if (!supabaseUrl) {
+      return NextResponse.json(
+        { error: "Missing env var SUPABASE_URL" },
+        { status: 500, headers: corsHeaders(origin) }
+      )
+    }
+    if (!supabaseServiceRoleKey) {
+      return NextResponse.json(
+        { error: "Missing env var SUPABASE_SERVICE_ROLE_KEY" },
+        { status: 500, headers: corsHeaders(origin) }
+      )
+    }
+    if (!openaiKey) {
+      return NextResponse.json(
+        { error: "Missing env var OPENAI_API_KEY" },
+        { status: 500, headers: corsHeaders(origin) }
+      )
     }
 
-    const system = `You write employee handbooks in Markdown. Output clean Markdown only. No code fences.`
+    const body = (await req.json()) as Body
+
+    const handbookId = String(body.handbookId || "")
+    const templateId = String(body.templateId || "employee")
+    const companyName = (body.companyName || "").trim() || "Your Company"
+    const state = (body.state || "").trim() || "your state"
+    const tone = String(body.tone || "Friendly")
+
+    if (!handbookId) {
+      return NextResponse.json(
+        { error: "Missing handbookId" },
+        { status: 400, headers: corsHeaders(origin) }
+      )
+    }
+
+    if (!isUuid(handbookId)) {
+      return NextResponse.json(
+        { error: "handbookId must be a UUID" },
+        { status: 400, headers: corsHeaders(origin) }
+      )
+    }
+
+    const supabase = createClient(supabaseUrl, supabaseServiceRoleKey)
+
+    // Confirm handbook exists
+    const { data: hb, error: hbErr } = await supabase
+      .from("handbooks")
+      .select("id, title")
+      .eq("id", handbookId)
+      .maybeSingle()
+
+    if (hbErr) {
+      return NextResponse.json(
+        { error: hbErr.message },
+        { status: 400, headers: corsHeaders(origin) }
+      )
+    }
+    if (!hb) {
+      return NextResponse.json(
+        { error: "Handbook not found" },
+        { status: 404, headers: corsHeaders(origin) }
+      )
+    }
+
     const prompt = `
-Create a complete ${templateId === "employee" ? "Employee Handbook" : "Handbook"} for "${companyName}".
+You are writing an employee handbook in Markdown.
+
+Template: ${templateId}
+Company: ${companyName}
 State: ${state}
 Tone: ${tone}
 
-Requirements:
-- Use clear section headings (H1/H2/H3).
-- Include: Welcome/Intro, Company Values, Employment Basics, Compensation & Payroll, Time Off, Benefits (generic), Workplace Conduct, Anti-Harassment, Safety, IT/Acceptable Use, Remote/Hybrid (if relevant), Performance, Discipline, Termination, Acknowledgement.
-- Add a short table of contents at the top with links (Markdown anchor links).
-- Keep it practical; avoid legal advice disclaimers beyond a simple sentence.
-`
+Return a complete handbook as Markdown with:
+- Table of contents
+- Clear headings (##)
+- Core HR policies
+- Benefits overview
+- Code of conduct
+- Time off + leave
+- Remote work policy
+- Anti-harassment and equal opportunity
+- Confidentiality + data security
+- Discipline + termination
+- Acknowledgement section
 
-    // Generate markdown
-    const response = await openai.responses.create({
+Output ONLY Markdown (no backticks code fences).
+`.trim()
+
+    const openai = new OpenAI({ apiKey: openaiKey })
+
+    // Responses API: safest way is output_text
+    const ai = await openai.responses.create({
       model: "gpt-4.1-mini",
-      input: [
-        { role: "system", content: system },
-        { role: "user", content: prompt },
-      ],
+      input: prompt,
     })
 
-    const content_md = (response as any).output_text ? String((response as any).output_text) : ""
-    if (!content_md.trim()) {
-      return jsonResponse({ error: "Generator returned empty content." }, 500)
+    const content_md = (ai.output_text || "").trim()
+
+    if (!content_md) {
+      return NextResponse.json(
+        { error: "Generator returned empty content." },
+        { status: 500, headers: corsHeaders(origin) }
+      )
     }
 
-    // Save into Supabase (safe even if your table doesn't have updated_at)
-    // Only updating columns that commonly exist.
-    const { error: upErr } = await supabase
+    // SAVE: adjust column name if needed (see note below)
+    const { error: updateErr } = await supabase
       .from("handbooks")
       .update({
-        // If your table uses a different column name, change this:
         content_md,
-        status: "draft",
+        updated_at: new Date().toISOString(),
       })
       .eq("id", handbookId)
 
-    if (upErr) {
-      // If your table doesn't have content_md, you’ll see an error here.
-      return jsonResponse({ error: upErr.message }, 400)
+    if (updateErr) {
+      return NextResponse.json(
+        { error: updateErr.message },
+        { status: 400, headers: corsHeaders(origin) }
+      )
     }
 
-    return jsonResponse({ content_md }, 200)
+    return NextResponse.json(
+      { content_md },
+      { status: 200, headers: corsHeaders(origin) }
+    )
   } catch (err: any) {
-    console.error("Generate route error:", err)
-    return jsonResponse({ error: err?.message || "Server error" }, 500)
+    console.error("Generate error:", err)
+    return NextResponse.json(
+      { error: err?.message || "Unknown error" },
+      { status: 500, headers: corsHeaders(origin) }
+    )
   }
 }
