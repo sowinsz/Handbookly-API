@@ -1,196 +1,135 @@
+import { NextResponse } from "next/server"
 import OpenAI from "openai"
 import { createClient } from "@supabase/supabase-js"
 
-export const runtime = "nodejs"
+/**
+ * ENV VARS REQUIRED IN VERCEL
+ *
+ * OPENAI_API_KEY
+ * SUPABASE_URL
+ * SUPABASE_SERVICE_ROLE_KEY
+ */
 
-function corsHeaders(origin: string | null) {
-    // In production you can lock this down to your Framer domain.
-    return {
-        "Access-Control-Allow-Origin": origin || "*",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
-        "Access-Control-Max-Age": "86400",
-    }
+// --- CORS ---
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
 }
 
-export async function OPTIONS(req: Request) {
-    return new Response(null, {
-        status: 204,
-        headers: corsHeaders(req.headers.get("origin")),
-    })
-}
-
-type GenerateBody = {
-    handbookId: string
-    userId?: string | null
-    templateId?: string | null
-    companyName?: string | null
-    state?: string | null
-    tone?: "Friendly" | "Formal" | "Direct" | string
-}
-
-function buildPrompt(input: {
-    templateId?: string | null
-    companyName?: string | null
-    state?: string | null
-    tone?: string | null
-}) {
-    const template = (input.templateId || "employee_handbook").toLowerCase()
-    const company = input.companyName?.trim() || "the company"
-    const state = input.state?.trim() || "the applicable state"
-    const tone = input.tone?.trim() || "Friendly"
-
-    // Keep it simple for now. We can expand templates later.
-    const templateDescription =
-        template === "employee_handbook"
-            ? "an Employee Handbook"
-            : `a ${template.replace(/_/g, " ")}`
-
-    return `
-You are an expert HR policy writer.
-
-Write ${templateDescription} in Markdown for ${company}.
-The handbook should be suitable for a US-based company and reference ${state} where appropriate.
-Tone: ${tone}.
-
-Requirements:
-- Output ONLY Markdown.
-- Use clear headings, bullet lists, and concise policy language.
-- Include these sections at minimum:
-  1) Welcome / Company Overview
-  2) Employment Basics (at-will, equal opportunity, anti-harassment)
-  3) Workplace Conduct
-  4) Time Off & Attendance
-  5) Compensation & Benefits (high-level)
-  6) Remote/Hybrid (if applicable as a general policy)
-  7) Safety & Security
-  8) IT / Acceptable Use
-  9) Complaints / Reporting
-  10) Acknowledgement (placeholder)
-- Add a brief disclaimer that it is not legal advice.
-`.trim()
+export async function OPTIONS() {
+  return new NextResponse(null, { status: 200, headers: corsHeaders })
 }
 
 export async function POST(req: Request) {
-    const origin = req.headers.get("origin")
-    const headers = corsHeaders(origin)
+  try {
+    // --- ENV CHECKS ---
+    const openaiKey = process.env.OPENAI_API_KEY
+    const supabaseUrl = process.env.SUPABASE_URL
+    const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY
 
-    try {
-        const supabaseUrl =
-            process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
-        const supabaseServiceRole =
-            process.env.SUPABASE_SERVICE_ROLE_KEY ||
-            process.env.SUPABASE_SERVICE_KEY
-
-        if (!supabaseUrl) {
-            return Response.json(
-                { error: "Missing SUPABASE_URL env var." },
-                { status: 500, headers }
-            )
-        }
-        if (!supabaseServiceRole) {
-            return Response.json(
-                { error: "Missing SUPABASE_SERVICE_ROLE_KEY env var." },
-                { status: 500, headers }
-            )
-        }
-
-        const openaiKey = process.env.OPENAI_API_KEY
-        if (!openaiKey) {
-            return Response.json(
-                { error: "Missing OPENAI_API_KEY env var." },
-                { status: 500, headers }
-            )
-        }
-
-        const body = (await req.json()) as GenerateBody
-
-        if (!body?.handbookId) {
-            return Response.json(
-                { error: "handbookId is required." },
-                { status: 400, headers }
-            )
-        }
-
-        const supabase = createClient(supabaseUrl, supabaseServiceRole, {
-            auth: { persistSession: false },
-        })
-
-        // (Optional but recommended) Ensure the handbook belongs to the user
-        // If userId is not provided, we skip this check.
-        if (body.userId) {
-            const { data: hb, error: hbErr } = await supabase
-                .from("handbooks")
-                .select("id, user_id")
-                .eq("id", body.handbookId)
-                .maybeSingle()
-
-            if (hbErr) {
-                return Response.json(
-                    { error: hbErr.message || "Could not load handbook." },
-                    { status: 500, headers }
-                )
-            }
-            if (!hb) {
-                return Response.json(
-                    { error: "Handbook not found." },
-                    { status: 404, headers }
-                )
-            }
-            if (hb.user_id !== body.userId) {
-                return Response.json(
-                    { error: "Not allowed." },
-                    { status: 403, headers }
-                )
-            }
-        }
-
-        const prompt = buildPrompt({
-            templateId: body.templateId,
-            companyName: body.companyName,
-            state: body.state,
-            tone: body.tone,
-        })
-
-        const openai = new OpenAI({ apiKey: openaiKey })
-
-        // Model choice: keep cheap/fast. You can change later.
-        const aiResp = await openai.responses.create({
-            model: "gpt-4o-mini",
-            input: prompt,
-        })
-
-        const content_md = (aiResp.output_text || "").trim()
-        if (!content_md) {
-            return Response.json(
-                { error: "Generator returned empty content." },
-                { status: 500, headers }
-            )
-        }
-
-        // Save markdown back to Supabase
-        const { error: updErr } = await supabase
-            .from("handbooks")
-            .update({
-                content_md,
-                template_id: body.templateId || null,
-                updated_at: new Date().toISOString(),
-            })
-            .eq("id", body.handbookId)
-
-        if (updErr) {
-            return Response.json(
-                { error: updErr.message || "Could not save content." },
-                { status: 500, headers }
-            )
-        }
-
-        return Response.json({ content_md }, { status: 200, headers })
-    } catch (e: any) {
-        return Response.json(
-            { error: e?.message || "Unexpected error." },
-            { status: 500, headers }
-        )
+    if (!openaiKey) {
+      return NextResponse.json(
+        { error: "OPENAI_API_KEY is missing" },
+        { status: 500, headers: corsHeaders }
+      )
     }
-}
 
+    if (!supabaseUrl || !supabaseKey) {
+      return NextResponse.json(
+        { error: "Supabase credentials are missing" },
+        { status: 500, headers: corsHeaders }
+      )
+    }
+
+    // --- PARSE BODY ---
+    const body = await req.json()
+    const {
+      handbookId,
+      templateId,
+      companyName,
+      state,
+      tone,
+    } = body
+
+    if (!handbookId) {
+      return NextResponse.json(
+        { error: "Missing handbookId" },
+        { status: 400, headers: corsHeaders }
+      )
+    }
+
+    // --- INIT CLIENTS ---
+    const openai = new OpenAI({ apiKey: openaiKey })
+
+    const supabase = createClient(supabaseUrl, supabaseKey)
+
+    // --- PROMPT ---
+    const prompt = `
+You are an expert HR compliance writer.
+
+Write a complete employee handbook in Markdown format.
+
+Template: ${templateId || "Employee Handbook"}
+Company: ${companyName || "The Company"}
+State: ${state || "United States"}
+Tone: ${tone || "Friendly"}
+
+Include:
+- Welcome & culture
+- Employment policies
+- Workplace conduct
+- Compensation & benefits
+- Time off
+- Compliance disclaimer
+
+Use clear headings and professional formatting.
+`
+
+    // --- OPENAI CALL ---
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: prompt,
+    })
+
+    const content =
+      response.output_text ||
+      response.output?.[0]?.content?.[0]?.text ||
+      ""
+
+    if (!content.trim()) {
+      return NextResponse.json(
+        { error: "OpenAI returned empty content" },
+        { status: 500, headers: corsHeaders }
+      )
+    }
+
+    // --- SAVE TO SUPABASE ---
+    const { error: updateError } = await supabase
+      .from("handbooks")
+      .update({
+        content_md: content,
+        template_id: templateId || null,
+        status: "draft",
+      })
+      .eq("id", handbookId)
+
+    if (updateError) {
+      return NextResponse.json(
+        { error: updateError.message },
+        { status: 500, headers: corsHeaders }
+      )
+    }
+
+    // --- SUCCESS ---
+    return NextResponse.json(
+      { content_md: content },
+      { status: 200, headers: corsHeaders }
+    )
+  } catch (err: any) {
+    return NextResponse.json(
+      { error: err?.message || "Unexpected error" },
+      { status: 500, headers: corsHeaders }
+    )
+  }
+}
