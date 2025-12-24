@@ -1,38 +1,42 @@
 import { NextResponse } from "next/server"
-import OpenAI from "openai"
 import { createClient } from "@supabase/supabase-js"
 
-export const runtime = "nodejs"
-// Helps avoid any caching weirdness on serverless routes
-export const dynamic = "force-dynamic"
+// IMPORTANT: Put your Framer site origin here (and any custom domain later).
+// You can also leave "*" if you don't use cookies/credentials.
+const ALLOWED_ORIGINS = [
+  "https://delicious-way-228843.framer.app",
+  // If you add a custom domain later, add it here:
+  // "https://handbookly.ai",
+]
 
-function corsHeaders(origin: string | null) {
-  // Allow all origins for now (easiest while building).
-  // You can lock this down later to: https://delicious-way-228843.framer.app
+function corsHeaders(req: Request) {
+  const origin = req.headers.get("origin") || ""
+  const allowOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : "*"
+
   return {
-    "Access-Control-Allow-Origin": origin || "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    // Helps proxies/CDNs behave when echoing Origin
     "Vary": "Origin",
   }
 }
 
-// Preflight handler (this is what your browser is complaining about)
-export async function OPTIONS(req: Request) {
-  const origin = req.headers.get("origin")
-  return new NextResponse(null, {
-    status: 204,
-    headers: corsHeaders(origin),
+function json(req: Request, body: any, status = 200) {
+  return NextResponse.json(body, {
+    status,
+    headers: corsHeaders(req),
   })
 }
 
-type Body = {
-  handbookId: string
-  userId?: string | null
-  templateId?: string
-  companyName?: string | null
-  state?: string | null
-  tone?: string
+function text(req: Request, body: string, status = 200) {
+  return new NextResponse(body, {
+    status,
+    headers: {
+      ...corsHeaders(req),
+      "Content-Type": "text/plain; charset=utf-8",
+    },
+  })
 }
 
 function isUuid(v: string) {
@@ -41,143 +45,152 @@ function isUuid(v: string) {
   )
 }
 
-export async function POST(req: Request) {
-  const origin = req.headers.get("origin")
+export async function OPTIONS(req: Request) {
+  // Preflight must return the CORS headers
+  return new NextResponse(null, { status: 204, headers: corsHeaders(req) })
+}
 
+export async function GET(req: Request) {
+  // This is just so visiting the URL in a browser doesn't look like "404".
+  // Your app should use POST.
+  return json(req, { ok: true, route: "/api/handbooks/generate" }, 200)
+}
+
+export async function POST(req: Request) {
   try {
+    const headers = corsHeaders(req)
+
     const supabaseUrl = process.env.SUPABASE_URL
     const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
     const openaiKey = process.env.OPENAI_API_KEY
 
-    if (!supabaseUrl) {
-      return NextResponse.json(
-        { error: "Missing env var SUPABASE_URL" },
-        { status: 500, headers: corsHeaders(origin) }
-      )
-    }
-    if (!supabaseServiceRoleKey) {
-      return NextResponse.json(
-        { error: "Missing env var SUPABASE_SERVICE_ROLE_KEY" },
-        { status: 500, headers: corsHeaders(origin) }
-      )
-    }
-    if (!openaiKey) {
-      return NextResponse.json(
-        { error: "Missing env var OPENAI_API_KEY" },
-        { status: 500, headers: corsHeaders(origin) }
-      )
-    }
+    if (!supabaseUrl) return NextResponse.json({ error: "SUPABASE_URL is missing" }, { status: 500, headers })
+    if (!supabaseServiceRoleKey) return NextResponse.json({ error: "SUPABASE_SERVICE_ROLE_KEY is missing" }, { status: 500, headers })
+    if (!openaiKey) return NextResponse.json({ error: "OPENAI_API_KEY is missing" }, { status: 500, headers })
 
-    const body = (await req.json()) as Body
+    const payload = await req.json().catch(() => null)
+    if (!payload) return NextResponse.json({ error: "Invalid JSON body" }, { status: 400, headers })
 
-    const handbookId = String(body.handbookId || "")
-    const templateId = String(body.templateId || "employee")
-    const companyName = (body.companyName || "").trim() || "Your Company"
-    const state = (body.state || "").trim() || "your state"
-    const tone = String(body.tone || "Friendly")
+    const {
+      handbookId,
+      userId, // optional (you can enforce ownership if you want)
+      templateId,
+      companyName,
+      state,
+      tone,
+    } = payload
 
-    if (!handbookId) {
-      return NextResponse.json(
-        { error: "Missing handbookId" },
-        { status: 400, headers: corsHeaders(origin) }
-      )
-    }
+    if (!handbookId || typeof handbookId !== "string")
+      return NextResponse.json({ error: "handbookId is required" }, { status: 400, headers })
 
-    if (!isUuid(handbookId)) {
-      return NextResponse.json(
-        { error: "handbookId must be a UUID" },
-        { status: 400, headers: corsHeaders(origin) }
-      )
-    }
+    if (!isUuid(handbookId))
+      return NextResponse.json({ error: "handbookId must be a UUID" }, { status: 400, headers })
 
-    const supabase = createClient(supabaseUrl, supabaseServiceRoleKey)
+    const template = String(templateId || "employee").toLowerCase()
+    const company = String(companyName || "Your Company").trim()
+    const usState = String(state || "your state").trim()
+    const style = String(tone || "Friendly").trim()
 
-    // Confirm handbook exists
+    const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
+      auth: { persistSession: false },
+    })
+
+    // Confirm the handbook exists (optional, but helps errors be clear)
     const { data: hb, error: hbErr } = await supabase
       .from("handbooks")
-      .select("id, title")
+      .select("id, user_id")
       .eq("id", handbookId)
       .maybeSingle()
 
     if (hbErr) {
-      return NextResponse.json(
-        { error: hbErr.message },
-        { status: 400, headers: corsHeaders(origin) }
-      )
+      return NextResponse.json({ error: hbErr.message }, { status: 500, headers })
     }
     if (!hb) {
-      return NextResponse.json(
-        { error: "Handbook not found" },
-        { status: 404, headers: corsHeaders(origin) }
-      )
+      return NextResponse.json({ error: "Handbook not found" }, { status: 404, headers })
     }
 
+    // Optional ownership check (recommended)
+    if (userId && hb.user_id && String(hb.user_id) !== String(userId)) {
+      return NextResponse.json({ error: "Not allowed for this handbook" }, { status: 403, headers })
+    }
+
+    // Prompt
+    const system = `You are an expert HR/compliance writer. Output ONLY markdown. No JSON.`
     const prompt = `
-You are writing an employee handbook in Markdown.
+Generate a complete employee handbook in markdown.
 
-Template: ${templateId}
-Company: ${companyName}
-State: ${state}
-Tone: ${tone}
+Context:
+- Template: ${template}
+- Company: ${company}
+- State: ${usState}
+- Tone: ${style}
 
-Return a complete handbook as Markdown with:
-- Table of contents
-- Clear headings (##)
-- Core HR policies
-- Benefits overview
-- Code of conduct
-- Time off + leave
-- Remote work policy
-- Anti-harassment and equal opportunity
-- Confidentiality + data security
-- Discipline + termination
-- Acknowledgement section
-
-Output ONLY Markdown (no backticks code fences).
+Requirements:
+- Start with a clear title and a table of contents with anchor links.
+- Include core policies: at-will employment disclaimer, equal employment opportunity, anti-harassment, reporting procedure, code of conduct, attendance, PTO/leave (keep it general), benefits overview, workplace safety, security, confidentiality, acceptable use, remote work (optional section), discipline, and acknowledgements.
+- Keep it practical and readable.
+- Add a short "State addendum: ${usState}" section near the end (general guidance; avoid making legal claims).
+- No legal advice disclaimer at the end.
 `.trim()
 
-    const openai = new OpenAI({ apiKey: openaiKey })
-
-    // Responses API: safest way is output_text
-    const ai = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      input: prompt,
+    // Call OpenAI Responses API via fetch (no openai npm dependency)
+    const aiResp = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${openaiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        input: [
+          { role: "system", content: system },
+          { role: "user", content: prompt },
+        ],
+      }),
     })
 
-    const content_md = (ai.output_text || "").trim()
+    const aiJson: any = await aiResp.json().catch(() => null)
 
-    if (!content_md) {
+    if (!aiResp.ok) {
       return NextResponse.json(
-        { error: "Generator returned empty content." },
-        { status: 500, headers: corsHeaders(origin) }
+        { error: aiJson?.error?.message || "OpenAI request failed" },
+        { status: 500, headers }
       )
     }
 
-    // SAVE: adjust column name if needed (see note below)
-    const { error: updateErr } = await supabase
+    const content =
+      String(aiJson?.output_text || "").trim() ||
+      // fallback extraction if output_text ever missing
+      String(aiJson?.output?.map((o: any) => o?.content?.map((c: any) => c?.text || "").join("")).join("\n") || "").trim()
+
+    if (!content) {
+      return NextResponse.json(
+        { error: "Generator returned empty content" },
+        { status: 500, headers }
+      )
+    }
+
+    // Save to Supabase
+    const { error: upErr } = await supabase
       .from("handbooks")
       .update({
-        content_md,
+        content_md: content,
+        template_id: template,
         updated_at: new Date().toISOString(),
       })
       .eq("id", handbookId)
 
-    if (updateErr) {
-      return NextResponse.json(
-        { error: updateErr.message },
-        { status: 400, headers: corsHeaders(origin) }
-      )
+    if (upErr) {
+      return NextResponse.json({ error: upErr.message }, { status: 500, headers })
     }
 
+    return NextResponse.json({ content_md: content }, { status: 200, headers })
+  } catch (e: any) {
+    // Ensure CORS headers even on unexpected errors
+    const headers = corsHeaders(new Request("http://localhost"))
     return NextResponse.json(
-      { content_md },
-      { status: 200, headers: corsHeaders(origin) }
-    )
-  } catch (err: any) {
-    console.error("Generate error:", err)
-    return NextResponse.json(
-      { error: err?.message || "Unknown error" },
-      { status: 500, headers: corsHeaders(origin) }
+      { error: e?.message || "Unknown error" },
+      { status: 500, headers }
     )
   }
 }
